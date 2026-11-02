@@ -13,14 +13,18 @@ import (
 	P "github.com/metacubex/mihomo/constant/provider"
 )
 
-type FallbackOption struct{}
+type FallbackOption struct {
+	Mode string `group:"fallback-mode,omitempty"`
+}
 
 type Fallback struct {
 	*GroupBase
-	disableUDP     bool
-	testUrl        string
-	selected       string
-	expectedStatus string
+	disableUDP      bool
+	testUrl         string
+	selected        string
+	expectedStatus  string
+	mode            fallbackMode
+	reliableCurrent string
 }
 
 func (f *Fallback) Now() string {
@@ -90,6 +94,7 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
 		"testUrl":        f.testUrl,
 		"expectedStatus": f.expectedStatus,
 		"fixed":          f.selected,
+		"fallbackMode":   f.mode,
 		"hidden":         f.Hidden(),
 		"icon":           f.Icon(),
 		"emptyFallback":  f.EmptyFallback().Name(),
@@ -104,19 +109,46 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 	proxies := f.GetProxies(touch)
-	for _, proxy := range proxies {
-		if len(f.selected) == 0 {
+	if len(f.selected) != 0 {
+		for _, proxy := range proxies {
+			if proxy.Name() != f.selected {
+				continue
+			}
 			if proxy.AliveForTestUrl(f.testUrl) {
 				return proxy
 			}
-		} else {
-			if proxy.Name() == f.selected {
-				if proxy.AliveForTestUrl(f.testUrl) {
-					return proxy
-				} else {
-					f.selected = ""
-				}
+			f.selected = ""
+			break
+		}
+	}
+
+	if len(f.selected) == 0 && f.mode == fallbackModeReliable {
+		candidates := make([]reliableCandidate, 0, len(proxies))
+		for _, proxy := range proxies {
+			state := C.ProxyState{}
+			if states := proxy.ExtraDelayHistories(); states != nil {
+				state = states[f.testUrl]
 			}
+			score, ready := reliabilityScore(state.History)
+			candidates = append(candidates, reliableCandidate{
+				name:  proxy.Name(),
+				alive: proxy.AliveForTestUrl(f.testUrl),
+				score: score,
+				ready: ready,
+			})
+		}
+		name := chooseReliableCandidate(candidates, f.reliableCurrent)
+		for _, proxy := range proxies {
+			if proxy.Name() == name {
+				f.reliableCurrent = name
+				return proxy
+			}
+		}
+	}
+
+	for _, proxy := range proxies {
+		if proxy.AliveForTestUrl(f.testUrl) {
+			return proxy
 		}
 	}
 
@@ -137,6 +169,7 @@ func (f *Fallback) Set(name string) error {
 	}
 
 	f.selected = name
+	f.reliableCurrent = name
 	if !p.AliveForTestUrl(f.testUrl) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
 		defer cancel()
@@ -149,6 +182,7 @@ func (f *Fallback) Set(name string) error {
 
 func (f *Fallback) ForceSet(name string) {
 	f.selected = name
+	f.reliableCurrent = name
 }
 
 func (f *Fallback) Providers() []P.ProxyProvider {
@@ -160,6 +194,11 @@ func (f *Fallback) Proxies() []C.Proxy {
 }
 
 func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Fallback, error) {
+	mode, err := parseFallbackMode(fallbackOption.Mode)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Fallback{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
@@ -178,5 +217,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,
+		mode:           mode,
 	}, nil
 }
